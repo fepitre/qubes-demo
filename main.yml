@@ -1,0 +1,222 @@
+- hosts: local
+  connection: local
+  tasks:
+      - name: Create fedora-demo template
+        qubesos:
+          guest: fedora-demo
+          vmtype: "TemplateVM"
+          label: black
+          state: present
+          template: "fedora-41-xfce"
+
+      - name: Create vault-demo
+        qubesos:
+          guest: vault-demo
+          label: black
+          state: present
+          template: "fedora-demo"
+          properties:
+            memory: 600
+            maxmem: 800
+            netvm: ""
+
+      - name: Create admin-demo
+        qubesos:
+          guest: admin-demo
+          label: red
+          state: present
+          template: "fedora-demo"
+          properties:
+            features:
+              service.sshd: true
+
+      - name: Create work-demo
+        qubesos:
+          guest: work-demo
+          label: blue
+          state: present
+          template: "fedora-demo"
+
+      - name: Create project-demo
+        qubesos:
+          guest: project-demo
+          label: orange
+          state: present
+          template: "fedora-demo"
+
+      - name: Create policy file
+        copy:
+          dest: /etc/qubes/policy.d/10-demo.policy
+          content: |
+            qubes.Gpg * work-demo vault-demo allow
+            project.Service1 * work-demo @default allow target=project-demo
+            qubes.ConnectTCP * work-demo @default allow target=admin-demo
+            admin.vm.Console * admin-demo project-demo allow target=dom0
+            admin.vm.Console * admin-demo vault-demo allow target=dom0
+          mode: '0755'
+
+- hosts: fedora-demo
+  become: yes
+  tasks:
+    - name: Define list of services
+      set_fact:
+        services:
+          - sshd.service
+          - docker.service
+          - docker.socket
+          - podman.service
+
+    - name: Create systemd drop-in directories
+      file:
+        path: "/etc/systemd/system/{{ item }}.d"
+        state: directory
+        mode: "0755"
+      loop: "{{ services }}"
+
+    - name: Create systemd drop-in files
+      copy:
+        dest: "/etc/systemd/system/{{ item }}.d/30_qubes.conf"
+        content: |
+          [Unit]
+          ConditionPathExists=/var/run/qubes-service/{{ item | replace('.service', '') | replace('.socket', '') }}
+        mode: "0644"
+      loop: "{{ services }}"
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Install openssh-server
+      package:
+        name: openssh-server
+        state: latest
+
+- hosts: admin-demo
+  become: true
+  tasks:
+    - name: Ensure bind-dirs config directory exists
+      file:
+        path: /rw/config/qubes-bind-dirs.d
+        state: directory
+        mode: '0755'
+        recurse: true
+
+    - name: Configure /etc/ssh to be persistent via bind-dirs
+      copy:
+        dest: /rw/config/qubes-bind-dirs.d/50_user.conf
+        content: |
+          binds+=( '/etc/ssh' )
+        mode: '0644'
+
+    - name: Ensure /rw/bind-dirs/etc/ssh exists
+      file:
+        path: /rw/bind-dirs/etc/ssh
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+        recurse: true
+
+    - name: Check if /etc/ssh is already a mountpoint
+      command: mountpoint -q /etc/ssh
+      register: ssh_mountpoint_check
+      ignore_errors: yes
+
+    - name: Copy existing /etc/ssh contents to /rw/bind-dirs/etc/ssh before first bind
+      command: cp -a /etc/ssh/. /rw/bind-dirs/etc/ssh/
+      when: ssh_mountpoint_check.rc != 0
+
+    - name: Apply bind-dirs changes without rebooting (if not already applied)
+      command: /usr/lib/qubes/init/bind-dirs.sh
+      when: ssh_mountpoint_check.rc != 0
+
+    - name: Delete existing SSH host keys
+      file:
+        path: "/rw/bind-dirs/etc/ssh/{{ item }}"
+        state: absent
+      loop:
+        - ssh_host_rsa_key
+        - ssh_host_rsa_key.pub
+        - ssh_host_ecdsa_key
+        - ssh_host_ecdsa_key.pub
+        - ssh_host_ed25519_key
+        - ssh_host_ed25519_key.pub
+
+    - name: Regenerate SSH host keys
+      command: ssh-keygen -A
+      args:
+        creates: "/etc/ssh/ssh_host_rsa_key"
+
+    - name: Restart SSH service
+      service:
+        name: sshd
+        state: restarted
+
+- hosts: vault-demo
+  vars:
+    gpg_params_file: /tmp/gpg-keyparams
+    gpg_homedir: "{{ ansible_env.HOME }}/.gnupg"
+    user_profile: "{{ ansible_env.HOME }}/.profile"
+  tasks:
+    - name: Ensure GnuPG home directory exists
+      file:
+        path: "{{ gpg_homedir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Create GPG key parameters file
+      copy:
+        dest: "{{ gpg_params_file }}"
+        content: |
+          Key-Type: RSA
+          Key-Length: 4096
+          Subkey-Type: RSA
+          Subkey-Length: 4096
+          Name-Real: Frédéric Pierret
+          Name-Email: frederic.pierret@notset.fr
+          Expire-Date: 0
+          %no-protection
+          %commit
+
+    - name: Check if GPG keyring is empty
+      command: "gpg2 --list-keys --homedir {{ gpg_homedir }}"
+      register: keyring_check
+      failed_when: false
+
+    - name: Generate GPG2 key using batch mode
+      command: "gpg2 --batch --generate-key {{ gpg_params_file }}"
+      register: gpg_generation
+      changed_when: "'gpg: key' in gpg_generation.stdout or gpg_generation.rc == 0"
+      when: "'pub' not in keyring_check.stdout"
+
+    - name: Autoaccept
+      copy:
+        dest: "{{ user_profile }}"
+        content: "export QUBES_GPG_AUTOACCEPT=86400"
+
+- hosts: work-demo
+  tasks:
+    - name: Setup GPG backend
+      become: true
+      copy:
+        dest: /rw/config/gpg-split-domain
+        content: "vault-demo"
+
+- hosts: project-demo
+  tasks:
+    - name: Ensure /usr/local/etc/qubes-rpc directory exists
+      become: true
+      file:
+        path: /usr/local/etc/qubes-rpc
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Create custom executable file project.Service1
+      become: true
+      copy:
+        dest: /usr/local/etc/qubes-rpc/project.Service1
+        content: |
+          #!/bin/bash
+          echo "Running custom project.Service1"
+        mode: '0755'

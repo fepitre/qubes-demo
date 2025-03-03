@@ -1,0 +1,20 @@
+local:
+  vars:
+    ansible_connection: local
+  hosts:
+    localhost: {}
+
+appvms:
+  vars:
+    ansible_connection: qubes
+  hosts:
+    vault-demo: {}
+    work-demo: {}
+    admin-demo: {}
+    project-demo: {}
+
+templatevms:
+  vars:
+    ansible_connection: qubes
+  hosts:
+    fedora-demo: {}
