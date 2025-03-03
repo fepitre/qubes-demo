@@ -91,6 +91,23 @@
         name: openssh-server
         state: latest
 
+- hosts: work-demo
+  tasks:
+    - name: Setup GPG backend
+      become: true
+      copy:
+        dest: /rw/config/gpg-split-domain
+        content: "vault-demo"
+
+    - name: Ensure SSH key exists for user
+      become: true
+      user:
+        name: user
+        generate_ssh_key: yes
+        ssh_key_type: rsa
+        ssh_key_bits: 4096
+        ssh_key_file: .ssh/id_rsa
+
 - hosts: admin-demo
   become: true
   tasks:
@@ -152,6 +169,30 @@
         name: sshd
         state: restarted
 
+    - name: Ensure .ssh directory exists for user
+      file:
+        path: /home/user/.ssh
+        state: directory
+        owner: user
+        group: user
+        mode: '0700'
+
+    - name: Fetch the generated SSH key
+      become: true
+      slurp:
+        src: /home/user/.ssh/id_rsa.pub
+      register: work_demo_ssh_key
+      delegate_to: work-demo
+
+    - name: Add work-demo SSH key to authorized_keys
+      lineinfile:
+        path: /home/user/.ssh/authorized_keys
+        line: "{{ work_demo_ssh_key['content'] | b64decode }}"
+        create: yes
+        owner: user
+        group: user
+        mode: '0600'
+
 - hosts: vault-demo
   vars:
     gpg_params_file: /tmp/gpg-keyparams
@@ -193,14 +234,6 @@
       copy:
         dest: "{{ user_profile }}"
         content: "export QUBES_GPG_AUTOACCEPT=86400"
-
-- hosts: work-demo
-  tasks:
-    - name: Setup GPG backend
-      become: true
-      copy:
-        dest: /rw/config/gpg-split-domain
-        content: "vault-demo"
 
 - hosts: project-demo
   tasks:
